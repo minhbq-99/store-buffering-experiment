@@ -23,6 +23,12 @@ struct vm {
 long vcpu_mmap_size;
 volatile int p0_ready;
 volatile int p1_ready;
+volatile int p0_done;
+volatile int p1_done;
+volatile int p0_reset;
+volatile int p1_reset;
+
+#define BARRIER __asm__("mfence":::"memory")
 
 /* 16-bit assembly */
 char p0[] = "\xe6\x01"			// out 1, al
@@ -200,15 +206,18 @@ int reset_vcpu(int vcpu_fd, int id)
 struct vcpu_handler {
 	struct vcpu *vcpu;
 	int cpu_id;
+	int number_of_tests;
+	void *map_addr;
 };
 
 void *handle_cpu(void *arg)
 {
 	struct vcpu_handler *handler = (struct vcpu_handler *) arg;
 	struct vcpu *vcpu = handler->vcpu;
-	int ret;
+	int ret, i, count = 0;
+	void *map_addr = handler->map_addr;
 	
-	while (1) {
+	for (i = 0; i < handler->number_of_tests; i++) {
 		ret = ioctl(vcpu->vcpu_fd, KVM_RUN, NULL);
 		if (ret < 0) {
 			perror("ioctl KVM_RUN");
@@ -216,14 +225,55 @@ void *handle_cpu(void *arg)
 		}
 		switch(vcpu->vcpu_run->exit_reason) {
 		case KVM_EXIT_HLT:
-			return NULL;
+			if (handler->cpu_id == 0) {
+				p0_done = 1;
+				BARRIER;
+				while (!p1_done);
+
+				if ((*((char *) map_addr + 2) == '\x00') &&
+					(*((char *) map_addr + 3) == '\x00'))
+					count++;
+
+				if ((*((char *) map_addr + 2) == '\xff') &&
+					(*((char *) map_addr + 3) == '\xff')) {
+
+					fprintf(stderr, "Violate synchronization requirement\n");
+					return (void *)-1;
+				}
+
+				/* Initial values in litmus test are 0 */
+				memset(map_addr, 0, 2);
+				/* Add garbage values to memory cell used to store result
+				 * for sanity check on synchronization requirement
+				 */
+				memset(map_addr + 2, '\xff', 2);
+
+				reset_vcpu(handler->vcpu->vcpu_fd, 0);
+				p1_done = 0;
+				BARRIER;
+			} else {
+				p1_done = 1;
+				BARRIER;
+				while (!p0_done);
+
+				reset_vcpu(handler->vcpu->vcpu_fd, 1);
+				p0_done = 0;
+				BARRIER;
+			}
+			continue;
 		case KVM_EXIT_IO:
 			if (handler->cpu_id == 0) {
 				p0_ready = 1;
+				BARRIER;
 				while (!p1_ready);
+				p1_ready = 0;
+				BARRIER;
 			} else {
 				p1_ready = 1;
+				BARRIER;
 				while (!p0_ready);
+				p0_ready = 0;
+				BARRIER;
 			}
 			continue;
 		default:
@@ -231,16 +281,20 @@ void *handle_cpu(void *arg)
 			return (void *)-1;
 		}
 	}
+
+	if (handler->cpu_id == 0)
+		printf("Non SC: %d\n", count);
+	return NULL;
 }
 
 int main(int argc, char **argv)
 {
-	int number_of_tests, i, count = 0;
+	int number_of_tests, i, err;
 	struct vm *vm;
 	struct vcpu *vcpu0, *vcpu1;
 	pthread_t thread0, thread1;
 	struct vcpu_handler handler0, handler1;
-	int err;
+	void *status0;
 
 	if (argc < 2) {
 		printf("Usage: kvm_sb number_of_tests\n");
@@ -266,39 +320,31 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	for (i = 0; i < number_of_tests; i++) {
-		handler0.cpu_id = 0;
-		handler0.vcpu = vcpu0;
-		pthread_create(&thread0, NULL, handle_cpu, &handler0);
-		if (err < 0) {
-			errno = err;
-			perror("pthread_create");
-			return 1;
-		}
-
-		handler1.cpu_id = 1;
-		handler1.vcpu = vcpu1;
-		pthread_create(&thread1, NULL, handle_cpu, &handler1);
-		if (err < 0) {
-			errno = err;
-			perror("pthread_create");
-			return 1;
-		}
-
-		pthread_join(thread0, NULL);
-		pthread_join(thread1, NULL);
-
-		if ((*((char *) vm->map_addr + 2) == '\x00') &&
-		    (*((char *) vm->map_addr + 3) == '\x00'))
-			count++;
-		reset_vcpu(vcpu0->vcpu_fd, 0);
-		reset_vcpu(vcpu1->vcpu_fd, 1);
-		p0_ready = 0;
-		p1_ready = 0;
-		memset(vm->map_addr, 0, 20);
+	handler0.cpu_id = 0;
+	handler0.vcpu = vcpu0;
+	handler0.number_of_tests = number_of_tests;
+	handler0.map_addr = vm->map_addr;
+	pthread_create(&thread0, NULL, handle_cpu, &handler0);
+	if (err < 0) {
+		errno = err;
+		perror("pthread_create");
+		return 1;
 	}
 
-	printf("Non SC: %d\n", count);
+	handler1.cpu_id = 1;
+	handler1.vcpu = vcpu1;
+	handler1.number_of_tests = number_of_tests;
+	pthread_create(&thread1, NULL, handle_cpu, &handler1);
+	if (err < 0) {
+		errno = err;
+		perror("pthread_create");
+		return 1;
+	}
+
+	pthread_join(thread0, &status0);
+	if (status0 == (void *)-1)
+		return 1;
+	pthread_join(thread1, NULL);
 
 	return 0;
 }

@@ -30,4 +30,8 @@ I mimic the litmus test in 2 ways:
 - This approach run tests much slower than the previous one maybe because I do too much switch between host and guest, but it requires fewer tests to observe non-SC behavior
 - Run 5000 tests I observe the non-SC behavior 10 times
 
+Update:
+- I use `perf` to find out much of the running time is used to create new threads. In this approach, I use 2 threads only to monitor the 2 vCPUs so I think I don't need to re-create threads per test running, just reset the vCPUs after each test. With the optimization, this approach runs super fast, x15 faster than the first approach and observe more non-SC behaviors. But the non-SC behaviors are so much more than the unoptimized one which makes me worry about the correctness of my implementation. However, I sanity check with fence between the store and load in litmus test, then I cannot observe non-SC behavior as expected. If you find any mistakes in the implemation, please let me know
+- Run 500000 tests with the optimized one I observe non-SC behavior 40000 times (not the average number)
+
 Happy learning!
